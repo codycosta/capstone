@@ -31,7 +31,7 @@ DRONE_RADIUS = 0.6
 OCCUPIED_THRESHOLD = 1
 REPLAN_INTERVAL = 1.5
 WAYPOINT_TOL = 1.0
-FORWARD_SPEED = 3.0
+FORWARD_SPEED = 5.0
 LOCAL_SAFETY_DIST = 1.0
 A_STAR_DIAGONAL_COST = 1.4
 TIMEOUT = 300
@@ -47,9 +47,9 @@ ALT_KP, ALT_KI, ALT_KD = 0.9, 0.03, 0.25
 
 # smoothing / XY control parameters
 POS_KP = 0.8                # P gain: meters -> m/s (velocity magnitude per meter of error)
-POS_KD = 0.01                # D gain for damping (small)
+POS_KD = 0.05                # D gain for damping (small)
 MAX_ACCEL = 2.0             # max change in velocity per second (m/s^2)
-VELOCITY_EMA_ALPHA = 0.50   # EMA smoothing factor (0..1)
+VELOCITY_EMA_ALPHA = 0.90   # EMA smoothing factor (0..1)
 VELOCITY_CMD_DURATION = 1 # seconds to hold each velocity command
 
 # LiDAR histogram bins
