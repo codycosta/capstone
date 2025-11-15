@@ -1,260 +1,599 @@
-# airsim_nav.py
+# airsim_astar_dashboard_patched.py
+"""
+Patched 6-panel robotics dashboard for AirSim A* navigation.
+Crash-proof plotting (guards + try/except) and stable control loop.
+"""
+
 import airsim
-import time
 import numpy as np
 import math
-import heapq
+import time
+from heapq import heappush, heappop
+from collections import deque
+from scipy.ndimage import binary_dilation
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import traceback
 
-# ---------- PARAMETERS ----------
-LIDAR_NAME = "LidarSensor1"   # name from settings.json
-GRID_RES = 0.2               # meters per grid cell
-GRID_SIZE = 200              # grid will be GRID_SIZE x GRID_SIZE
-DRONE_HEIGHT = -2.0          # flight altitude in NED (negative Z)
-HEIGHT_TOLERANCE = 1.0       # consider points within ± this meter of DRONE_HEIGHT as obstacles
-OCCUPIED_THRESHOLD = 1       # cells with >= this hits are obstacles
-REPLAN_DISTANCE = 2.0        # meters ahead to trigger replan
-WAYPOINT_TOL = 0.5           # meters to accept waypoint
-MAX_VELOCITY = 2.0          # m/s
-LOCAL_SAFETY_DIST = 1.0     # m — if obstacle within this, stop and replan
-PLANNER_HZ = 1.0
-LOCAL_LOOP_HZ = 10.0
+# ---------------- PARAMETERS ----------------
+LIDAR_NAME = "LidarSensor1"
+GRID_RES = 0.5
+GRID_RADIUS_M = 25.0
+GRID_SIZE = int((GRID_RADIUS_M * 2) / GRID_RES)
+DRONE_ALT = -3.0
+DRONE_RADIUS = 0.6
+OCCUPIED_THRESHOLD = 1
+REPLAN_INTERVAL = 1.5
+WAYPOINT_TOL = 1.0
+FORWARD_SPEED = 3.0
+LOCAL_SAFETY_DIST = 1.0
+A_STAR_DIAGONAL_COST = 1.4
+TIMEOUT = 300
 
-# Grid origin is centered at initial position
-# ---------- UTILITIES ----------
-def euler_from_quat(q):
-    # AirSim stores quaternion as (w,x,y,z)
+# plotting / history
+PLOT_ENABLED = True
+PLOT_FPS = 8               # limit updates per second (approx)
+HISTORY_SEC = 30           # seconds of history for time plots
+HIST_LEN = int(HISTORY_SEC * PLOT_FPS)
+
+# altitude PID
+ALT_KP, ALT_KI, ALT_KD = 0.9, 0.03, 0.25
+
+# LiDAR histogram bins
+LIDAR_MAX_RANGE = 30.0
+LIDAR_BINS = 30
+
+# ------------------------------------------------
+
+# --------------- Utilities ----------------------
+def quat_to_rot_mat(q):
     w, x, y, z = q.w_val, q.x_val, q.y_val, q.z_val
-    # convert to roll, pitch, yaw
-    t0 = +2.0 * (w * x + y * z)
-    t1 = +1.0 - 2.0 * (x * x + y * y)
-    roll = math.atan2(t0, t1)
-    t2 = +2.0 * (w * y - z * x)
-    t2 = +1.0 if t2 > +1.0 else t2
-    t2 = -1.0 if t2 < -1.0 else t2
-    pitch = math.asin(t2)
-    t3 = +2.0 * (w * z + x * y)
-    t4 = +1.0 - 2.0 * (y * y + z * z)
-    yaw = math.atan2(t3, t4)
-    return roll, pitch, yaw
+    R = np.array([
+        [1 - 2*(y*y + z*z), 2*(x*y - z*w),     2*(x*z + y*w)],
+        [2*(x*y + z*w),     1 - 2*(x*x + z*z), 2*(y*z - x*w)],
+        [2*(x*z - y*w),     2*(y*z + x*w),     1 - 2*(x*x + y*y)]
+    ], dtype=np.float32)
+    return R
 
-def world_to_grid(idx_origin, origin_xyz, x, y):
-    # origin_xyz = [x0,y0] of grid center in world coords
-    dx = x - origin_xyz[0]
-    dy = y - origin_xyz[1]
-    ix = int(round(dx / GRID_RES)) + idx_origin
-    iy = int(round(dy / GRID_RES)) + idx_origin
+def transform_lidar_points(lidar_data, kin):
+    if not hasattr(lidar_data, 'point_cloud') or lidar_data.point_cloud is None:
+        return np.zeros((0,3), dtype=np.float32)
+    pc = np.array(lidar_data.point_cloud, dtype=np.float32)
+    if pc.size == 0:
+        return np.zeros((0,3), dtype=np.float32)
+    try:
+        pts = pc.reshape(-1, 3)
+    except Exception:
+        return np.zeros((0,3), dtype=np.float32)
+    R = quat_to_rot_mat(kin.orientation)
+    t = np.array([kin.position.x_val, kin.position.y_val, kin.position.z_val], dtype=np.float32)
+    pts_world = (R @ pts.T).T + t
+    return pts_world
+
+def world_xy_to_grid_ix(origin_xy, x, y):
+    ix = int(round((x - origin_xy[0] + GRID_RADIUS_M) / GRID_RES))
+    iy = int(round((y - origin_xy[1] + GRID_RADIUS_M) / GRID_RES))
     return ix, iy
 
-def grid_to_world(idx_origin, origin_xyz, ix, iy):
-    dx = (ix - idx_origin) * GRID_RES
-    dy = (iy - idx_origin) * GRID_RES
-    return origin_xyz[0] + dx, origin_xyz[1] + dy
+def grid_ix_to_world_xy(origin_xy, ix, iy):
+    x = origin_xy[0] + (ix * GRID_RES) - GRID_RADIUS_M
+    y = origin_xy[1] + (iy * GRID_RES) - GRID_RADIUS_M
+    return x, y
 
-# ---------- A* ----------
-def astar(grid, start, goal):
-    # grid: 2D numpy where 0=free, 1=occupied
-    h = lambda a,b: math.hypot(a[0]-b[0], a[1]-b[1])
+# --------------- A* --------------------------------
+def astar_grid(grid, start, goal):
     rows, cols = grid.shape
+    sx, sy = start
+    gx, gy = goal
+    if not (0 <= sx < rows and 0 <= sy < cols): return None
+    if not (0 <= gx < rows and 0 <= gy < cols): return None
+    if grid[gx, gy] != 0: return None
+
+    def heur(a,b): return math.hypot(a[0]-b[0], a[1]-b[1])
+
     open_set = []
-    heapq.heappush(open_set, (0 + h(start,goal), 0, start, None))
+    heappush(open_set, (heur(start, goal), 0.0, start, None))
     came_from = {}
-    gscore = {start: 0}
-    visited = set()
+    gscore = {start: 0.0}
+    closed = set()
+
     while open_set:
-        f, g, current, parent = heapq.heappop(open_set)
-        if current in visited:
-            continue
-        visited.add(current)
+        f, g, current, parent = heappop(open_set)
+        if current in closed: continue
         came_from[current] = parent
         if current == goal:
-            # reconstruct path
-            path = []
+            path = [current]
             cur = current
-            while cur is not None:
-                path.append(cur)
+            while came_from[cur] is not None:
                 cur = came_from[cur]
+                path.append(cur)
             path.reverse()
             return path
-        # neighbors (8-connected)
+        closed.add(current)
         for dx in (-1,0,1):
             for dy in (-1,0,1):
-                if dx==0 and dy==0:
-                    continue
+                if dx == 0 and dy == 0: continue
                 nei = (current[0]+dx, current[1]+dy)
-                if not (0 <= nei[0] < rows and 0 <= nei[1] < cols):
-                    continue
-                if grid[nei[0], nei[1]] != 0:
-                    continue
-                tentative_g = g + math.hypot(dx,dy)
+                if not (0 <= nei[0] < rows and 0 <= nei[1] < cols): continue
+                if grid[nei[0], nei[1]] != 0: continue
+                tentative_g = g + (A_STAR_DIAGONAL_COST if dx!=0 and dy!=0 else 1.0)
                 if nei not in gscore or tentative_g < gscore[nei]:
                     gscore[nei] = tentative_g
-                    fscore = tentative_g + h(nei, goal)
-                    heapq.heappush(open_set, (fscore, tentative_g, nei, current))
+                    heappush(open_set, (tentative_g + heur(nei, goal), tentative_g, nei, current))
     return None
 
-# ---------- MAIN AUTONOMY CLASS ----------
-class SimpleNav:
-    def __init__(self, client, grid_res=GRID_RES, grid_size=GRID_SIZE):
+# --------------- Navigator ------------------------
+class DashboardNavigator:
+    def __init__(self, client):
         self.client = client
-        self.grid_res = grid_res
-        self.grid_size = grid_size
-        self.idx_origin = grid_size // 2
-        self.grid = np.zeros((grid_size, grid_size), dtype=np.uint8)
-        self.origin_world = None  # will be set to initial xy
-        self.last_plan = []
+        self.grid = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.uint8)
+        self.origin_xy = None       # fixed on first grid build
+        self.origin_locked = False
+        self.path_world = []
         self.last_plan_time = 0.0
 
-    def update_pose(self):
+        # altitude PID
+        self.alt_integral = 0.0
+        self.prev_alt_err = 0.0
+        self.prev_alt_time = time.time()
+
+        # plotting/history buffers
+        self.traj_history = deque(maxlen=HIST_LEN)   # list of (x,y)
+        self.time_history = deque(maxlen=HIST_LEN)
+        self.alt_history = deque(maxlen=HIST_LEN)
+        self.alt_cmd_history = deque(maxlen=HIST_LEN)
+        self.vx_cmd_history = deque(maxlen=HIST_LEN)
+        self.vy_cmd_history = deque(maxlen=HIST_LEN)
+        self.vx_act_history = deque(maxlen=HIST_LEN)
+        self.vy_act_history = deque(maxlen=HIST_LEN)
+        self.lidar_ranges_hist = deque(maxlen=HIST_LEN)
+        self.last_plot_time = 0.0
+
+        # plotting setup
+        if PLOT_ENABLED:
+            self._init_plots()
+
+    # ---------- plotting init ----------
+    def _init_plots(self):
+        plt.ion()
+        self.fig = plt.figure(figsize=(14,8))
+        gs = self.fig.add_gridspec(2,3, wspace=0.35, hspace=0.35)
+
+        self.ax_grid = self.fig.add_subplot(gs[0,0])
+        self.ax_traj = self.fig.add_subplot(gs[0,1])
+        self.ax_heading = self.fig.add_subplot(gs[0,2])
+        self.ax_alt = self.fig.add_subplot(gs[1,0])
+        self.ax_vel = self.fig.add_subplot(gs[1,1])
+        self.ax_hist = self.fig.add_subplot(gs[1,2])
+
+        # initial artists
+        self.im = self.ax_grid.imshow(np.zeros((GRID_SIZE, GRID_SIZE)), origin='lower',
+                                     extent=[-GRID_RADIUS_M, GRID_RADIUS_M, -GRID_RADIUS_M, GRID_RADIUS_M],
+                                     cmap='Greys', vmin=0, vmax=1)
+        self.scatter_lidar = self.ax_grid.scatter([], [], s=5, c='cyan', alpha=0.8)
+        self.line_path, = self.ax_grid.plot([], [], 'r.-', linewidth=2, markersize=4)
+        self.goal_pt, = self.ax_grid.plot([], [], 'g*', markersize=12)
+        self.drone_pt, = self.ax_grid.plot([], [], 'ro', markersize=6)
+        self.safety_circle = patches.Circle((0,0), LOCAL_SAFETY_DIST, edgecolor='orange', facecolor='none', alpha=0.6)
+        self.ax_grid.add_patch(self.safety_circle)
+        self.ax_grid.set_title('Occupancy Grid + LiDAR + Path')
+        self.ax_grid.set_xlabel('X (m)')
+        self.ax_grid.set_ylabel('Y (m)')
+
+        # traj plot
+        self.traj_line, = self.ax_traj.plot([], [], '-', linewidth=1)
+        self.ax_traj.plot([], [], 'go', label='goal')
+        self.cur_pt, = self.ax_traj.plot([], [], 'ro', label='drone')
+        self.ax_traj.set_title('Trajectory (Breadcrumbs)')
+        self.ax_traj.set_xlabel('X (m)')
+        self.ax_traj.set_ylabel('Y (m)')
+        self.ax_traj.legend(loc='upper right')
+
+        # heading plot (arrow)
+        self.ax_heading.set_xlim(-1,1)
+        self.ax_heading.set_ylim(-1,1)
+        self.ax_heading.set_title('Heading (blue) and Commanded Velocity (red)')
+        self.ax_heading.axis('off')
+
+        # altitude
+        self.alt_line, = self.ax_alt.plot([], [], label='actual z')
+        self.alt_cmd_line, = self.ax_alt.plot([], [], label='target z')
+        self.ax_alt.set_title('Altitude (NED: negative up)')
+        self.ax_alt.set_xlabel('Time (s)')
+        self.ax_alt.set_ylabel('Z (m)')
+        self.ax_alt.legend()
+
+        # velocity vs time (prepare empty lines; will set data later)
+        self.vx_cmd_line, = self.ax_vel.plot([], [], label='vx_cmd')
+        self.vy_cmd_line, = self.ax_vel.plot([], [], label='vy_cmd')
+        self.vx_act_line, = self.ax_vel.plot([], [], label='vx_act', linestyle='--')
+        self.vy_act_line, = self.ax_vel.plot([], [], label='vy_act', linestyle='--')
+        self.ax_vel.set_title('Commanded vs Actual Velocity')
+        self.ax_vel.set_xlabel('Time (s)')
+        self.ax_vel.set_ylabel('m/s')
+        self.ax_vel.legend()
+
+        # lidar histogram
+        self.hist_bins = np.linspace(0, LIDAR_MAX_RANGE, LIDAR_BINS+1)
+        self.ax_hist.set_title('LiDAR Ranges Histogram')
+        self.ax_hist.set_xlabel('Range (m)')
+        self.ax_hist.set_ylabel('Counts')
+
+        plt.show()
+
+    # ---------- grid build (fixed origin) ----------
+    def build_grid_from_lidar(self):
+        state = self.client.getMultirotorState()
+        kin = state.kinematics_estimated
+        lidar = self.client.getLidarData(lidar_name=LIDAR_NAME)
+        pts_world = transform_lidar_points(lidar, kin)
+
+        # lock origin on first valid call
+        if not self.origin_locked:
+            self.origin_xy = (kin.position.x_val, kin.position.y_val)
+            self.origin_locked = True
+
+        # reset counts
+        counts = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.uint16)
+        if pts_world.shape[0] > 0:
+            zmin, zmax = DRONE_ALT - 3.0, DRONE_ALT + 3.0
+            mask = (pts_world[:,2] >= zmin) & (pts_world[:,2] <= zmax)
+            pts_xy = pts_world[mask][:,:2]
+            for x,y in pts_xy:
+                ix, iy = world_xy_to_grid_ix(self.origin_xy, x, y)
+                if 0 <= ix < GRID_SIZE and 0 <= iy < GRID_SIZE:
+                    counts[ix, iy] += 1
+
+        occ = (counts >= OCCUPIED_THRESHOLD).astype(np.uint8)
+        inflate_cells = int(math.ceil(DRONE_RADIUS / GRID_RES))
+        if inflate_cells > 0:
+            occ = binary_dilation(occ, iterations=inflate_cells).astype(np.uint8)
+        self.grid = occ
+
+        # store last LiDAR points and ranges for plotting + histogram
+        self.last_lidar_pts = pts_world
+        horiz = None
+        if pts_world.shape[0] > 0:
+            horiz = np.hypot(pts_world[:,0] - kin.position.x_val, pts_world[:,1] - kin.position.y_val)
+        self.last_lidar_ranges = horiz if horiz is not None else np.array([])
+
+    # ---------- planning ----------
+    def plan_path(self, goal_xy):
+        if not self.origin_locked: return None
+        start = (GRID_SIZE // 2, GRID_SIZE // 2)
+        gx, gy = world_xy_to_grid_ix(self.origin_xy, goal_xy[0], goal_xy[1])
+        gx = max(0, min(GRID_SIZE - 1, gx))
+        gy = max(0, min(GRID_SIZE - 1, gy))
+        if self.grid[gx, gy] == 1:
+            # try small local search for nearby free cell
+            found = False
+            for r in range(1, 6):
+                for dx in range(-r, r+1):
+                    for dy in range(-r, r+1):
+                        nx, ny = gx + dx, gy + dy
+                        if 0 <= nx < GRID_SIZE and 0 <= ny < GRID_SIZE and self.grid[nx, ny] == 0:
+                            gx, gy = nx, ny
+                            found = True
+                            break
+                    if found: break
+                if found: break
+            if not found:
+                return None
+
         state = self.client.getMultirotorState()
         pos = state.kinematics_estimated.position
-        pose_xyz = (pos.x_val, pos.y_val, pos.z_val)
-        ori = state.kinematics_estimated.orientation
-        _,_,yaw = euler_from_quat(ori)
-        return pose_xyz, yaw
+        sx, sy = world_xy_to_grid_ix(self.origin_xy, pos.x_val, pos.y_val)
+        idx_path = astar_grid(self.grid, (sx, sy), (gx, gy))
+        if idx_path is None: return None
 
-    def clear_grid(self):
-        self.grid.fill(0)
-
-    def build_occupancy_from_lidar(self):
-        # reset
-        self.grid.fill(0)
-        lidar_data = self.client.getLidarData(lidar_name=LIDAR_NAME)
-        if not hasattr(lidar_data, 'point_cloud') or len(lidar_data.point_cloud) == 0:
-            return
-        pts = np.array(lidar_data.point_cloud, dtype=np.float32).reshape(-1,3)
-        # get world origin if not set
-        pose, _ = self.update_pose()
-        if self.origin_world is None:
-            self.origin_world = (pose[0], pose[1])
-        # Transform lidar points (are in vehicle local or world? AirSim Lidar returns sensor-local)
-        # AirSim LIDAR points are in world coords when return in this function; if not, you'd transform using pose.
-        # We'll assume world coords for simplicity; check your Lidar settings
-        for (x,y,z) in pts:
-            # height filter relative to DRONE_HEIGHT
-            if abs(z - DRONE_HEIGHT) <= HEIGHT_TOLERANCE:
-                ix, iy = world_to_grid(self.idx_origin, self.origin_world, x, y)
-                if 0 <= ix < self.grid_size and 0 <= iy < self.grid_size:
-                    self.grid[ix, iy] += 1
-        # threshold to binary occupancy
-        self.grid = (self.grid >= OCCUPIED_THRESHOLD).astype(np.uint8)
-
-    def plan_to_goal(self, goal_world):
-        # goal_world = (x,y) in world coords
-        if self.origin_world is None:
-            print("Origin not set - run lidar update once")
-            return None
-        # start
-        pose, _ = self.update_pose()
-        start_ix, start_iy = world_to_grid(self.idx_origin, self.origin_world, pose[0], pose[1])
-        goal_ix, goal_iy = world_to_grid(self.idx_origin, self.origin_world, goal_world[0], goal_world[1])
-        # bounds check
-        rows,cols = self.grid.shape
-        start = (max(0,min(rows-1,start_ix)), max(0,min(cols-1,start_iy)))
-        goal = (max(0,min(rows-1,goal_ix)), max(0,min(cols-1,goal_iy)))
-        path = astar(self.grid, start, goal)
-        if path is None:
-            print("No path found")
-            return None
-        # convert to world
-        world_path = [grid_to_world(self.idx_origin, self.origin_world, p[0], p[1]) for p in path]
-        self.last_plan = world_path
+        path_world = []
+        for ix, iy in idx_path:
+            wx, wy = grid_ix_to_world_xy(self.origin_xy, ix, iy)
+            path_world.append((wx, wy))
+        self.path_world = path_world
         self.last_plan_time = time.time()
-        return world_path
+        return path_world
 
-    def nearest_obstacle_dist(self):
-        # quick safety check: compute min distance from current pose to any occupied grid cell
-        pose, _ = self.update_pose()
-        px, py = pose[0], pose[1]
-        # compute coordinates of all occupied cells
-        occ = np.argwhere(self.grid==1)
-        if occ.size==0:
+    # ---------- obstacle & nearest check ----------
+    def nearest_obstacle_distance(self):
+        occ = np.argwhere(self.grid == 1)
+        if occ.size == 0:
             return float('inf')
-        dists = np.hypot((occ[:,0]-self.idx_origin)*self.grid_res - (px - self.origin_world[0]),
-                         (occ[:,1]-self.idx_origin)*self.grid_res - (py - self.origin_world[1]))
-        return float(np.min(dists))
+        occ_xy = np.array([grid_ix_to_world_xy(self.origin_xy, int(i), int(j)) for i, j in occ])
+        pos = self.client.getMultirotorState().kinematics_estimated.position
+        px, py = pos.x_val, pos.y_val
+        return float(np.min(np.hypot(occ_xy[:,0] - px, occ_xy[:,1] - py)))
 
-    def follow_path(self, path):
-        # path is list of (x,y) world coords
-        if path is None or len(path)==0:
+    # ---------- altitude PID ----------
+    def altitude_hold(self):
+        state = self.client.getMultirotorState()
+        current_alt = state.kinematics_estimated.position.z_val
+        error = DRONE_ALT - current_alt
+        now = time.time()
+        dt = max(now - self.prev_alt_time, 1e-3)
+        self.alt_integral += error * dt
+        derivative = (error - self.prev_alt_err) / dt
+        vz = ALT_KP * error + ALT_KI * self.alt_integral + ALT_KD * derivative
+        vz = max(min(vz, 2.0), -2.0)
+        self.prev_alt_err = error
+        self.prev_alt_time = now
+        return float(vz)
+
+    # ---------- follow path (A* only) ----------
+    def follow_path(self, goal_xy):
+        if not self.path_world or len(self.path_world) == 0:
             return False
-        # simple waypoint follower
-        idx = 0
-        rate = 1.0 / LOCAL_LOOP_HZ
-        while idx < len(path):
-            pose, yaw = self.update_pose()
-            px, py, pz = pose
-            wx, wy = path[idx]
-            dx = wx - px; dy = wy - py
-            dist = math.hypot(dx, dy)
-            # safety check
-            if self.nearest_obstacle_dist() < LOCAL_SAFETY_DIST:
-                print("Obstacle too close - abort and replan")
-                self.client.moveByVelocityAsync(0,0,0,1).join()
-                return False
-            if dist < WAYPOINT_TOL:
-                idx += 1
-                continue
-            # velocity command toward waypoint
-            vx = (dx/dist) * min(MAX_VELOCITY, dist)
-            vy = (dy/dist) * min(MAX_VELOCITY, dist)
-            vz = 0  # maintain altitude (we assume DRONE_HEIGHT constant)
-            # send body-frame velocity or world-frame: moveByVelocityAsync uses world frame by default
-            self.client.moveByVelocityAsync(vx, vy, 0, duration=1.0/LOCAL_LOOP_HZ).join()
-            time.sleep(rate)
+
+        # single-step follow of the next waypoint
+        state = self.client.getMultirotorState()
+        kin = state.kinematics_estimated
+        px, py = kin.position.x_val, kin.position.y_val
+
+        # record history
+        tnow = time.time()
+        self.traj_history.append((px, py))
+        self.time_history.append(tnow)
+        self.alt_history.append(kin.position.z_val)
+        self.alt_cmd_history.append(DRONE_ALT)
+
+        # commanded waypoint
+        wx, wy = self.path_world[0]
+        dist = math.hypot(wx - px, wy - py)
+        if dist < WAYPOINT_TOL:
+            # pop waypoint and continue
+            self.path_world.pop(0)
+            return True
+
+        desired_heading = math.atan2(wy - py, wx - px)
+        desired_speed = min(FORWARD_SPEED, dist)
+        vx_cmd = float(desired_speed * math.cos(desired_heading))
+        vy_cmd = float(desired_speed * math.sin(desired_heading))
+        vz_cmd = self.altitude_hold()
+
+        # actual velocity approx
+        vel = getattr(kin, 'linear_velocity', None)
+        if vel is not None:
+            vx_act = float(vel.x_val)
+            vy_act = float(vel.y_val)
+        else:
+            if len(self.traj_history) >= 2:
+                (px_prev, py_prev) = self.traj_history[-2]
+                dt = max(tnow - self.time_history[-2], 1e-3)
+                vx_act = float((px - px_prev) / dt)
+                vy_act = float((py - py_prev) / dt)
+            else:
+                vx_act = 0.0
+                vy_act = 0.0
+
+        # send velocities (float-casted)
+        self.client.moveByVelocityAsync(float(vx_cmd), float(vy_cmd), float(vz_cmd), float(0.3)).join()
+
+        # store commanded/actual velocities for plotting
+        self.vx_cmd_history.append(vx_cmd)
+        self.vy_cmd_history.append(vy_cmd)
+        self.vx_act_history.append(vx_act)
+        self.vy_act_history.append(vy_act)
+
+        # lidar ranges for histogram
+        if hasattr(self, 'last_lidar_ranges') and self.last_lidar_ranges is not None:
+            self.lidar_ranges_hist.append(self.last_lidar_ranges)
+        else:
+            self.lidar_ranges_hist.append(np.array([]))
+
         return True
 
-# ---------- DEMO RUN ----------
-def demo_run(goal_xy):
+    # ---------- plotting update (robust) ----------
+    def update_plots(self, goal_xy):
+        if not PLOT_ENABLED:
+            return
+        now = time.time()
+        if now - self.last_plot_time < 1.0 / PLOT_FPS:
+            return
+        self.last_plot_time = now
+
+        try:
+            # 1) Grid + LiDAR + Path
+            try:
+                self.im.set_data(np.flipud(self.grid.T))
+                if hasattr(self, 'last_lidar_pts') and self.last_lidar_pts.shape[0] > 0:
+                    pts = self.last_lidar_pts
+                    xs = pts[:,0] - self.origin_xy[0]
+                    ys = pts[:,1] - self.origin_xy[1]
+                    mask = (np.abs(xs) <= GRID_RADIUS_M) & (np.abs(ys) <= GRID_RADIUS_M)
+                    xs = xs[mask]; ys = ys[mask]
+                    self.scatter_lidar.set_offsets(np.column_stack((xs, ys)))
+                else:
+                    self.scatter_lidar.set_offsets(np.zeros((0,2)))
+                if self.path_world and len(self.path_world) > 0:
+                    pxs = [p[0] - self.origin_xy[0] for p in self.path_world]
+                    pys = [p[1] - self.origin_xy[1] for p in self.path_world]
+                    self.line_path.set_data(pxs, pys)
+                    self.goal_pt.set_data([goal_xy[0] - self.origin_xy[0]], [goal_xy[1] - self.origin_xy[1]])
+                else:
+                    self.line_path.set_data([], [])
+                    self.goal_pt.set_data([], [])
+            except Exception:
+                # keep going if any grid/point issue occurs
+                traceback.print_exc()
+
+            # 2) Trajectory & safety circle
+            try:
+                if len(self.traj_history) > 0:
+                    dx, dy = self.traj_history[-1]
+                    self.drone_pt.set_data([dx - self.origin_xy[0]], [dy - self.origin_xy[1]])
+                    self.safety_circle.center = (dx - self.origin_xy[0], dy - self.origin_xy[1])
+                    xs = [p[0] for p in self.traj_history]
+                    ys = [p[1] for p in self.traj_history]
+                    xs_local = [x - self.origin_xy[0] for x in xs]
+                    ys_local = [y - self.origin_xy[1] for y in ys]
+                    if len(xs_local) >= 2:
+                        self.traj_line.set_data(xs_local, ys_local)
+                        self.ax_traj.set_xlim(min(xs_local) - 2, max(xs_local) + 2)
+                        self.ax_traj.set_ylim(min(ys_local) - 2, max(ys_local) + 2)
+                        self.cur_pt.set_data([xs_local[-1]], [ys_local[-1]])
+                else:
+                    self.traj_line.set_data([], [])
+                    self.cur_pt.set_data([], [])
+            except Exception:
+                traceback.print_exc()
+
+            # 3) Heading & commanded velocity arrow
+            try:
+                self.ax_heading.clear()
+                self.ax_heading.set_xlim(-1,1)
+                self.ax_heading.set_ylim(-1,1)
+                if len(self.vx_act_history) > 0 or len(self.vx_cmd_history) > 0:
+                    # actual
+                    vx_act = self.vx_act_history[-1] if len(self.vx_act_history)>0 else 0.0
+                    vy_act = self.vy_act_history[-1] if len(self.vy_act_history)>0 else 0.0
+                    # cmd
+                    vxc = self.vx_cmd_history[-1] if len(self.vx_cmd_history)>0 else 0.0
+                    vyc = self.vy_cmd_history[-1] if len(self.vy_cmd_history)>0 else 0.0
+                    scale = 0.5
+                    self.ax_heading.arrow(0, 0, vx_act*scale, vy_act*scale, head_width=0.08, color='blue', length_includes_head=True)
+                    self.ax_heading.arrow(0, 0, vxc*scale, vyc*scale, head_width=0.08, color='red', length_includes_head=True)
+                self.ax_heading.set_title('Heading (blue) and Commanded Velocity (red)')
+                self.ax_heading.axis('off')
+            except Exception:
+                traceback.print_exc()
+
+            # 4) Altitude over time (robust)
+            try:
+                if len(self.time_history) >= 2 and len(self.alt_history) >= 2:
+                    t0 = self.time_history[0]
+                    times = np.array(self.time_history) - t0
+                    # match lengths
+                    n = min(len(times), len(self.alt_history), len(self.alt_cmd_history))
+                    if n >= 2:
+                        times_trim = times[:n]
+                        alt_trim = list(self.alt_history)[:n]
+                        alt_cmd_trim = list(self.alt_cmd_history)[:n]
+                        self.alt_line.set_data(times_trim, alt_trim)
+                        self.alt_cmd_line.set_data(times_trim, alt_cmd_trim)
+                        self.ax_alt.relim(); self.ax_alt.autoscale_view(True,True,True)
+                # else skip altitude plotting for now
+            except Exception:
+                traceback.print_exc()
+
+            # 5) Commanded vs Actual velocity (robust)
+            try:
+                # ensure we have matched arrays
+                n = min(len(self.time_history), len(self.vx_cmd_history), len(self.vy_cmd_history),
+                        len(self.vx_act_history), len(self.vy_act_history))
+                if n >= 2:
+                    t0 = self.time_history[0]
+                    times = np.array(self.time_history) - t0
+                    t_trim = times[:n]
+                    vx_cmd = list(self.vx_cmd_history)[:n]
+                    vy_cmd = list(self.vy_cmd_history)[:n]
+                    vx_act = list(self.vx_act_history)[:n]
+                    vy_act = list(self.vy_act_history)[:n]
+                    self.vx_cmd_line.set_data(t_trim, vx_cmd)
+                    self.vy_cmd_line.set_data(t_trim, vy_cmd)
+                    self.vx_act_line.set_data(t_trim, vx_act)
+                    self.vy_act_line.set_data(t_trim, vy_act)
+                    self.ax_vel.relim(); self.ax_vel.autoscale_view(True,True,True)
+                # if not enough data, skip updating this panel (no return)
+            except Exception:
+                traceback.print_exc()
+
+            # 6) LiDAR histogram (robust)
+            try:
+                all_ranges = np.concatenate([r for r in self.lidar_ranges_hist if r is not None and r.size>0]) if len(self.lidar_ranges_hist)>0 else np.array([])
+                self.ax_hist.clear()
+                if all_ranges.size>0:
+                    self.ax_hist.hist(all_ranges, bins=self.hist_bins)
+                else:
+                    self.ax_hist.text(0.5, 0.5, 'No LiDAR points', ha='center', va='center')
+                self.ax_hist.set_xlim(0, LIDAR_MAX_RANGE)
+                self.ax_hist.set_title('LiDAR Ranges Histogram')
+            except Exception:
+                traceback.print_exc()
+
+            # refresh canvas
+            try:
+                self.fig.canvas.draw()
+                self.fig.canvas.flush_events()
+            except Exception:
+                # if drawing fails, print and continue; do not raise to caller
+                traceback.print_exc()
+
+        except Exception:
+            # top-level safety net: log the error but don't crash whole mission loop
+            print("Unexpected plotting error (caught):")
+            traceback.print_exc()
+
+# --------------- Mission loop -------------------
+def run_mission(goal_xy):
     client = airsim.MultirotorClient()
     client.confirmConnection()
     client.enableApiControl(True)
     client.armDisarm(True)
+    print("[mission] takeoff")
     client.takeoffAsync().join()
-    # climb to DRONE_HEIGHT (negative in NED)
-    client.moveToZAsync(DRONE_HEIGHT, 1.0).join()
+    client.moveToZAsync(float(DRONE_ALT), 1.0).join()
 
-    nav = SimpleNav(client)
-    t0 = time.time()
+    nav = DashboardNavigator(client)
+    t_start = time.time()
+
     try:
-        # initial occupancy build
-        nav.build_occupancy_from_lidar()
-        # plan
-        path = nav.plan_to_goal(goal_xy)
-        if path is None:
-            print("Can't find path to goal")
-            return
-        print("Planned %d waypoints" % len(path))
-        # follow with replanning on failure or periodically
-        success = False
-        while time.time() - t0 < 300:  # 5 minute timeout
-            # if no path or need replan
-            if nav.last_plan is None or (time.time() - nav.last_plan_time) > (1.0/PLANNER_HZ):
-                nav.build_occupancy_from_lidar()
-                path = nav.plan_to_goal(goal_xy)
-            # follow current path
-            ok = nav.follow_path(path)
-            if ok:
-                # check final dist to goal
-                pose, _ = nav.update_pose()
-                dgoal = math.hypot(pose[0]-goal_xy[0], pose[1]-goal_xy[1])
-                if dgoal <= WAYPOINT_TOL:
-                    print("Reached goal!")
-                    success = True
-                    break
+        while time.time() - t_start < TIMEOUT:
+            # build grid & update LiDAR points (origin locked at first build)
+            nav.build_grid_from_lidar()
+
+            # planning decision
+            need_plan = (nav.path_world is None or len(nav.path_world)==0
+                         or time.time() - nav.last_plan_time > REPLAN_INTERVAL
+                         or nav.nearest_obstacle_distance() < LOCAL_SAFETY_DIST)
+            if need_plan:
+                path = nav.plan_path(goal_xy)
+                if path is None:
+                    # hover & retry
+                    client.moveByVelocityAsync(float(0), float(0), float(0), float(1)).join()
+                    time.sleep(0.5)
+                    continue
             else:
-                # replan after short pause
-                time.sleep(0.5)
-                nav.build_occupancy_from_lidar()
-                path = nav.plan_to_goal(goal_xy)
-        if not success:
-            print("Failed to reach goal within timeout")
+                path = nav.path_world
+
+            # follow one step along path
+            ok = nav.follow_path(goal_xy)
+            # update plotting (robust)
+            nav.update_plots(goal_xy)
+
+            # arrival check
+            pos = client.getMultirotorState().kinematics_estimated.position
+            dist_to_goal = math.hypot(pos.x_val - goal_xy[0], pos.y_val - goal_xy[1])
+            if ok and dist_to_goal < WAYPOINT_TOL:
+                print("[mission] reached goal! smooth landing...")
+                client.moveToZAsync(float(DRONE_ALT)+2, 1.0).join()   # small hover
+                client.moveToZAsync(float(-1), 0.6).join()            # controlled descent
+                client.landAsync().join()
+                client.armDisarm(False)
+                client.enableApiControl(False)
+                if PLOT_ENABLED:
+                    plt.ioff(); plt.show()
+                return True
+
+            # sleep small amount to keep loop rate reasonable
+            time.sleep(0.02)
+
     finally:
-        client.moveToZAsync(-1, 1).join()
-        client.landAsync().join()
+        print("[mission] landing (fallback)")
+        try:
+            client.moveToZAsync(float(-1), 1.0).join()
+            client.landAsync().join()
+        except Exception:
+            pass
         client.armDisarm(False)
         client.enableApiControl(False)
+        if PLOT_ENABLED:
+            plt.ioff(); plt.show()
+    return False
 
+# ---------------- Entry ----------------
 if __name__ == "__main__":
-    # set your target in world coords (x,y). For example 10, 0 meters ahead.
-    target = (10.0, 0.0)
-    demo_run(target)
+    TARGET_X = 10.0
+    TARGET_Y = 8.0
+    print("Starting mission to:", (TARGET_X, TARGET_Y))
+    ok = run_mission((TARGET_X, TARGET_Y))
+    print("Mission finished. Success =", ok)
