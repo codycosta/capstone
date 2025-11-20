@@ -1,0 +1,5 @@
+airsim==1.7.0
+mavsdk==0.38.0
+numpy
+scipy
+matplotlib
